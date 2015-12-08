@@ -2,17 +2,25 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path"
 	"strconv"
-	"strings"
+	"syscall"
 	"time"
 
+	"github.com/shirou/gopsutil/process"
 	"github.com/spf13/cobra"
 )
+
+type ProcessStatus struct {
+	Pid  int32
+	Name string  // Name of process
+	CPU  float64 // Percent of CPU used since last check
+	VMS  uint64  // Virtual memory size
+	RSS  uint64  // Resident set size
+	Swap uint64  // Swap size
+}
 
 var (
 	flagVerbose  bool
@@ -47,7 +55,7 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	execCmd := exec.Command("rkt", "run", args[0], "--insecure-options=image")
+	execCmd := exec.Command("rkt", "run", args[0], "--insecure-options=image", "--net=host")
 	err = execCmd.Start()
 	if err != nil {
 		fmt.Printf("%v\n", err)
@@ -63,19 +71,27 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	usages := make(map[int][]ProcessStatus)
+	usages := make(map[int32][]*ProcessStatus)
 
-	var usage []ProcessStatus
-
-	timeToEnd := time.Now().Add(d)
-	for time.Now().Before(timeToEnd) {
-		usage = getUsage(execCmd.Process.Pid, usage)
+	timeToStop := time.Now().Add(d)
+	for time.Now().Before(timeToStop) {
+		usage, err := getUsage(int32(execCmd.Process.Pid))
+		if err != nil {
+			panic(err)
+		}
 		if flagVerbose {
 			printUsage(usage)
 		}
 
-		for _, process := range usage {
-			usages[process.Pid] = append(usages[process.Pid], process)
+		for _, ps := range usage {
+			usages[ps.Pid] = append(usages[ps.Pid], ps)
+		}
+
+		_, err = process.NewProcess(int32(execCmd.Process.Pid))
+		if err != nil {
+			// process.Process.IsRunning is not implemented yet
+			fmt.Fprintf(os.Stderr, "rkt exited prematurely\n")
+			break
 		}
 
 		time.Sleep(time.Second)
@@ -84,33 +100,74 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 	execCmd.Process.Kill()
 
 	for _, processHistory := range usages {
-		var avgCPU uint64
+		var avgCPU float64
 		var avgMem uint64
 		var peakMem uint64
 
-		for _, process := range processHistory {
-			avgCPU += process.GetCPUUsageUser()
-			avgMem += process.VmSize
-			if peakMem < process.VmPeak {
-				peakMem = process.VmPeak
+		for _, p := range processHistory {
+			avgCPU += p.CPU
+			avgMem += p.VMS
+			if peakMem < p.VMS {
+				peakMem = p.VMS
 			}
 		}
 
-		avgCPU = avgCPU / uint64(len(processHistory))
+		avgCPU = avgCPU / float64(len(processHistory))
 		avgMem = avgMem / uint64(len(processHistory))
 
-		fmt.Printf("%s(%d): seconds alive: %d  avg CPU: %d%%  avg Mem: %s  peak Mem: %s\n", processHistory[0].Name, processHistory[0].Pid, len(processHistory), avgCPU, formatSize(avgMem), formatSize(peakMem))
+		fmt.Printf("%s(%d): seconds alive: %d  avg CPU: %f%%  avg Mem: %s  peak Mem: %s\n", processHistory[0].Name, processHistory[0].Pid, len(processHistory), avgCPU, formatSize(avgMem), formatSize(peakMem))
 	}
 }
 
-func getUsage(pid int, lastStatuses []ProcessStatus) []ProcessStatus {
-	status := getProcStatus(pid, lastStatuses)
-	children := getChildrenPids(pid)
-	var childrenStatuses []ProcessStatus
-	for _, child := range children {
-		childrenStatuses = append(childrenStatuses, getUsage(child, lastStatuses)...)
+func getUsage(pid int32) ([]*ProcessStatus, error) {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return nil, err
 	}
-	return append([]ProcessStatus{status}, childrenStatuses...)
+	var statuses []*ProcessStatus
+	processes := []*process.Process{p}
+	for i := 0; i < len(processes); i++ {
+		p := processes[i]
+		s, err := getProcStatus(p)
+		if err != nil {
+			return nil, err
+		}
+		statuses = append(statuses, s)
+		children, err := p.Children()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.Sys().(syscall.WaitStatus).ExitStatus() == 1 {
+				// An ExitError with a code of 1 will be returned when there are no children
+				continue
+			} else {
+				return nil, err
+			}
+		}
+		processes = append(processes, children...)
+	}
+	return statuses, nil
+}
+
+func getProcStatus(p *process.Process) (*ProcessStatus, error) {
+	n, err := p.Name()
+	if err != nil {
+		return nil, err
+	}
+	c, err := p.CPUPercent(0)
+	if err != nil {
+		return nil, err
+	}
+	m, err := p.MemoryInfo()
+	if err != nil {
+		return nil, err
+	}
+	return &ProcessStatus{
+		Pid:  p.Pid,
+		Name: n,
+		CPU:  c,
+		VMS:  m.VMS,
+		RSS:  m.RSS,
+		Swap: m.Swap,
+	}, nil
 }
 
 func formatSize(size uint64) string {
@@ -126,206 +183,9 @@ func formatSize(size uint64) string {
 	return strconv.FormatUint(size, 10) + " B"
 }
 
-func printUsage(statuses []ProcessStatus) {
-	for _, status := range statuses {
-		fmt.Printf("Pid: %s Name: %s CPU: %s FDSize: %s VmPeak: %s VmSize: %s VmHWM: %s VmRSS: %s Threads: %s\n",
-			pad(strconv.Itoa(status.Pid)),
-			pad(status.Name),
-			pad(strconv.FormatUint(status.GetCPUUsageUser(), 10)+"%"),
-			pad(formatSize(status.FDSize)),
-			pad(formatSize(status.VmPeak)),
-			pad(formatSize(status.VmSize)),
-			pad(formatSize(status.VmHWM)),
-			pad(formatSize(status.VmRSS)),
-			pad(strconv.FormatUint(status.Threads, 10)))
+func printUsage(statuses []*ProcessStatus) {
+	for _, s := range statuses {
+		fmt.Printf("%s(%d): Mem: %s CPU: %f\n", s.Name, s.Pid, formatSize(s.VMS), s.CPU)
 	}
 	fmt.Printf("\n")
-}
-
-type ProcessStatus struct {
-	Pid           int
-	Name          string
-	FDSize        uint64 // Number of file descriptor slots currently allocated.
-	VmPeak        uint64 // Peak virtual memory size.
-	VmSize        uint64 // Virtual memory size
-	VmHWM         uint64 // Peak resident set size ("high water mark").
-	VmRSS         uint64 // Resident set size.
-	Threads       uint64 // Number of threads in process containing this thread.
-	Utime         uint64 // Userspace CPU ticks
-	LastUtime     uint64 // Userspace CPU ticks last time we checked
-	Stime         uint64 // Kernel CPU ticks
-	LastStime     uint64 // Kernel CPU ticks last time we checked
-	TimeTotal     uint64 // total system ticks
-	LastTimeTotal uint64 // total system ticks last time we checked
-}
-
-// http://stackoverflow.com/questions/1420426/calculating-cpu-usage-of-a-process-in-linux
-func (ps ProcessStatus) GetCPUUsageUser() uint64 {
-	return 100 * (ps.Utime - ps.LastUtime) / (ps.TimeTotal - ps.LastTimeTotal)
-}
-
-func (ps ProcessStatus) GetCPUUsageKernel() uint64 {
-	return 100 * (ps.Stime - ps.LastStime) / (ps.TimeTotal - ps.LastTimeTotal)
-}
-
-func pad(str string) string {
-	for i := len(str); i < 16; i++ {
-		str = str + " "
-	}
-	return str
-}
-
-func getProcStatus(pid int, lastStatuses []ProcessStatus) ProcessStatus {
-	status := ProcessStatus{
-		Pid: pid,
-	}
-	var lastStatus ProcessStatus
-	for _, s := range lastStatuses {
-		if s.Pid == pid {
-			lastStatus = s
-		}
-	}
-	status.LastUtime = lastStatus.Utime
-	status.LastStime = lastStatus.Stime
-	status.LastTimeTotal = lastStatus.TimeTotal
-
-	blob, err := ioutil.ReadFile(path.Join("/proc", strconv.Itoa(pid), "status"))
-	if err != nil {
-		panic(err)
-	}
-	lines := strings.Split(string(blob), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		tokens := strings.Split(line, ":")
-		if len(tokens) != 2 {
-			panic(fmt.Sprintf("couldn't parse: %q", line))
-		}
-
-		for i := 0; i < len(tokens); i++ {
-			tokens[i] = strings.TrimSpace(tokens[i])
-		}
-
-		var err error
-		switch tokens[0] {
-		case "Name":
-			status.Name = tokens[1]
-		case "FDSize":
-			status.FDSize, err = strconv.ParseUint(tokens[1], 10, 64)
-			if err != nil {
-				panic(err)
-			}
-		case "VmPeak":
-			status.VmPeak = parseLabeledSize(tokens[1])
-		case "VmSize":
-			status.VmSize = parseLabeledSize(tokens[1])
-		case "VmHWM":
-			status.VmHWM = parseLabeledSize(tokens[1])
-		case "VmRSS":
-			status.VmRSS = parseLabeledSize(tokens[1])
-		case "Threads":
-			status.Threads, err = strconv.ParseUint(tokens[1], 10, 64)
-			if err != nil {
-				panic(err)
-			}
-		}
-	}
-
-	blob, err = ioutil.ReadFile("/proc/stat")
-	if err != nil {
-		panic(err)
-	}
-	lines = strings.Split(string(blob), "\n")
-	for _, line := range lines {
-		if !strings.HasPrefix(line, "cpu ") {
-			continue
-		}
-		tokens := strings.Split(line, "	")
-		for _, token := range tokens {
-			for _, token := range strings.Split(token, " ") {
-				num, err := strconv.ParseUint(token, 10, 64)
-				if err != nil {
-					continue
-				}
-				status.TimeTotal += num
-			}
-		}
-	}
-	if status.TimeTotal == 0 {
-		panic("failed to read total time")
-	}
-
-	blob, err = ioutil.ReadFile(path.Join("/proc", strconv.Itoa(pid), "stat"))
-	if err != nil {
-		panic(err)
-	}
-	tokens := strings.Split(string(blob), " ")
-	if len(tokens) < 15 {
-		panic(fmt.Sprintf("couldn't parse: %q", string(blob)))
-	}
-	status.Utime, err = strconv.ParseUint(tokens[13], 10, 64)
-	if err != nil {
-		panic(err)
-	}
-	status.Stime, err = strconv.ParseUint(tokens[14], 10, 64)
-	if err != nil {
-		panic(err)
-	}
-	return status
-}
-
-func parseProcStat(blob string) (int, int, int) {
-	return 0, 0, 0
-}
-
-func getChildrenPids(pid int) []int {
-	blob, err := exec.Command("pgrep", "-P", strconv.Itoa(pid)).Output()
-	if len(blob) == 0 {
-		return nil
-	}
-	if err != nil {
-		panic(err)
-	}
-
-	pidStrings := strings.Split(string(blob), "\n")
-
-	var pids []int
-	for _, str := range pidStrings {
-		if str == "" {
-			continue
-		}
-		childPid, err := strconv.Atoi(str)
-		if err != nil {
-			panic(err)
-		}
-		pids = append(pids, childPid)
-	}
-
-	return pids
-}
-
-func parseLabeledSize(size string) uint64 {
-	var num uint64
-
-	i, _ := fmt.Sscanf(size, "%d B", &num)
-	if i == 1 {
-		return num
-	}
-
-	i, _ = fmt.Sscanf(size, "%d kB", &num)
-	if i == 1 {
-		return num * 1024
-	}
-
-	i, _ = fmt.Sscanf(size, "%d mB", &num)
-	if i == 1 {
-		return num * 1024 * 1024
-	}
-
-	i, _ = fmt.Sscanf(size, "%d gB", &num)
-	if i == 1 {
-		return num * 1024 * 1024 * 1024
-	}
-	panic(fmt.Sprintf("unrecognized size label: %s", size))
 }

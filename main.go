@@ -20,6 +20,7 @@ type ProcessStatus struct {
 	VMS  uint64  // Virtual memory size
 	RSS  uint64  // Resident set size
 	Swap uint64  // Swap size
+	P    *process.Process
 }
 
 var (
@@ -66,7 +67,10 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		for _ = range c {
-			execCmd.Process.Kill()
+			err := killAllChildren(int32(execCmd.Process.Pid))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cleanup failed: %v\n", err)
+			}
 			os.Exit(1)
 		}
 	}()
@@ -97,7 +101,10 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 		time.Sleep(time.Second)
 	}
 
-	execCmd.Process.Kill()
+	err = killAllChildren(int32(execCmd.Process.Pid))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cleanup failed: %v\n", err)
+	}
 
 	for _, processHistory := range usages {
 		var avgCPU float64
@@ -117,6 +124,40 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 
 		fmt.Printf("%s(%d): seconds alive: %d  avg CPU: %f%%  avg Mem: %s  peak Mem: %s\n", processHistory[0].Name, processHistory[0].Pid, len(processHistory), avgCPU, formatSize(avgMem), formatSize(peakMem))
 	}
+}
+
+func killAllChildren(pid int32) error {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return err
+	}
+	processes := []*process.Process{p}
+	for i := 0; i < len(processes); i++ {
+		children, err := processes[i].Children()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.Sys().(syscall.WaitStatus).ExitStatus() == 1 {
+				// An ExitError with a code of 1 will be returned when there are no children
+				continue
+			} else {
+				return err
+			}
+		}
+		processes = append(processes, children...)
+	}
+	for _, p := range processes {
+		osProcess, err := os.FindProcess(int(p.Pid))
+		if err != nil {
+			if err.Error() == "os: process already finished" {
+				continue
+			}
+			return err
+		}
+		err = osProcess.Kill()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func getUsage(pid int32) ([]*ProcessStatus, error) {
@@ -167,6 +208,7 @@ func getProcStatus(p *process.Process) (*ProcessStatus, error) {
 		VMS:  m.VMS,
 		RSS:  m.RSS,
 		Swap: m.Swap,
+		P:    p,
 	}, nil
 }
 

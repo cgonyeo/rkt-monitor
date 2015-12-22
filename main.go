@@ -113,9 +113,9 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 
 		for _, p := range processHistory {
 			avgCPU += p.CPU
-			avgMem += p.VMS
-			if peakMem < p.VMS {
-				peakMem = p.VMS
+			avgMem += p.RSS
+			if peakMem < p.RSS {
+				peakMem = p.RSS
 			}
 		}
 

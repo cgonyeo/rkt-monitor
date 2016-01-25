@@ -20,10 +20,11 @@ type ProcessStatus struct {
 	VMS  uint64  // Virtual memory size
 	RSS  uint64  // Resident set size
 	Swap uint64  // Swap size
-	P    *process.Process
 }
 
 var (
+	pidMap map[int32]*process.Process
+
 	flagVerbose  bool
 	flagDuration string
 
@@ -36,6 +37,8 @@ var (
 )
 
 func init() {
+	pidMap = make(map[int32]*process.Process)
+
 	cmdRktMonitor.Flags().BoolVarP(&flagVerbose, "verbose", "v", false, "Print current usage every second")
 	cmdRktMonitor.Flags().StringVarP(&flagDuration, "duration", "d", "10s", "How long to run the ACI")
 }
@@ -161,20 +164,25 @@ func killAllChildren(pid int32) error {
 }
 
 func getUsage(pid int32) ([]*ProcessStatus, error) {
-	p, err := process.NewProcess(pid)
-	if err != nil {
-		return nil, err
-	}
 	var statuses []*ProcessStatus
-	processes := []*process.Process{p}
-	for i := 0; i < len(processes); i++ {
-		p := processes[i]
-		s, err := getProcStatus(p)
+	pids := []int32{pid}
+	for i := 0; i < len(pids); i++ {
+		proc, ok := pidMap[pids[i]]
+		if !ok {
+			var err error
+			proc, err = process.NewProcess(pids[i])
+			if err != nil {
+				return nil, err
+			}
+			pidMap[pids[i]] = proc
+		}
+		s, err := getProcStatus(proc)
 		if err != nil {
 			return nil, err
 		}
 		statuses = append(statuses, s)
-		children, err := p.Children()
+
+		children, err := proc.Children()
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.Sys().(syscall.WaitStatus).ExitStatus() == 1 {
 				// An ExitError with a code of 1 will be returned when there are no children
@@ -183,7 +191,17 @@ func getUsage(pid int32) ([]*ProcessStatus, error) {
 				return nil, err
 			}
 		}
-		processes = append(processes, children...)
+
+	childloop:
+		for _, child := range children {
+			for _, p := range pids {
+				if p == child.Pid {
+					fmt.Printf("%d is in %#v\n", p, pids)
+					continue childloop
+				}
+			}
+			pids = append(pids, child.Pid)
+		}
 	}
 	return statuses, nil
 }
@@ -208,7 +226,6 @@ func getProcStatus(p *process.Process) (*ProcessStatus, error) {
 		VMS:  m.VMS,
 		RSS:  m.RSS,
 		Swap: m.Swap,
-		P:    p,
 	}, nil
 }
 

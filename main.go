@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/appc/spec/schema"
 	"github.com/shirou/gopsutil/process"
 	"github.com/spf13/cobra"
 )
@@ -25,12 +27,13 @@ type ProcessStatus struct {
 var (
 	pidMap map[int32]*process.Process
 
-	flagVerbose  bool
-	flagDuration string
+	flagVerbose    bool
+	flagDuration   string
+	flagShowOutput bool
 
 	cmdRktMonitor = &cobra.Command{
 		Use:     "rkt-monitor IMAGE",
-		Short:   "Runs the specified ACI with rkt, and monitors rkt's usage",
+		Short:   "Runs the specified ACI or pod manifest with rkt, and monitors rkt's usage",
 		Example: "rkt-monitor mem-stresser.aci -v -d 30s",
 		Run:     runRktMonitor,
 	}
@@ -41,6 +44,7 @@ func init() {
 
 	cmdRktMonitor.Flags().BoolVarP(&flagVerbose, "verbose", "v", false, "Print current usage every second")
 	cmdRktMonitor.Flags().StringVarP(&flagDuration, "duration", "d", "10s", "How long to run the ACI")
+	cmdRktMonitor.Flags().BoolVarP(&flagShowOutput, "show-output", "o", false, "Display rkt's stdout and stderr")
 }
 
 func main() {
@@ -59,7 +63,35 @@ func runRktMonitor(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	execCmd := exec.Command("rkt", "run", args[0], "--insecure-options=image", "--net=host")
+	if os.Getuid() != 0 {
+		fmt.Printf("need to be root to run rkt images\n")
+		os.Exit(1)
+	}
+
+	f, err := os.Open(args[0])
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		os.Exit(1)
+	}
+	decoder := json.NewDecoder(f)
+
+	podManifest := false
+	man := schema.PodManifest{}
+	err = decoder.Decode(&man)
+	if err == nil {
+		podManifest = true
+	}
+
+	var execCmd *exec.Cmd
+	if podManifest {
+		execCmd = exec.Command("rkt", "run", "--pod-manifest", args[0], "--net=host")
+	} else {
+		execCmd = exec.Command("rkt", "run", args[0], "--insecure-options=image", "--net=host")
+	}
+	if flagShowOutput {
+		execCmd.Stdout = os.Stdout
+		execCmd.Stderr = os.Stderr
+	}
 	err = execCmd.Start()
 	if err != nil {
 		fmt.Printf("%v\n", err)
@@ -244,7 +276,7 @@ func formatSize(size uint64) string {
 
 func printUsage(statuses []*ProcessStatus) {
 	for _, s := range statuses {
-		fmt.Printf("%s(%d): Mem: %s CPU: %f\n", s.Name, s.Pid, formatSize(s.VMS), s.CPU)
+		fmt.Printf("%s(%d): Mem: %s CPU: %f\n", s.Name, s.Pid, formatSize(s.RSS), s.CPU)
 	}
 	fmt.Printf("\n")
 }
